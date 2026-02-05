@@ -68,52 +68,74 @@ Create the script at `/home/teslacam/sync_tesla.sh`.
 ```bash
 #!/bin/bash
 
-# Configuration
-MQTT_HOST="<HA_IP>"
-MQTT_USER="<USER>"
-MQTT_PASS="<PASS>"
+# ======================
+# Configuración MQTT
+# ======================
+MQTT_HOST="${MQTT_HOST}"
+MQTT_USER="${MQTT_USER}"
+MQTT_PASS="${MQTT_PASS}"
+
 TOPIC_STATUS="tesla/pi/status"
 TOPIC_TIME="tesla/pi/last_sync"
 
-# 1. Environment Detection
-CURRENT_SSID=$(iwgetid -r)
+# ======================
+# Configuración NAS
+# ======================
+NAS_USER="${NAS_USER}"
+NAS_HOST="${NAS_HOST}"
+NAS_PATH="${NAS_PATH}"
+
+# 1. Detectar red y hora
+CURRENT_SSID=$(/usr/sbin/iwgetid -r)
 CURRENT_HOUR=$(date +%-H)
 CURRENT_MIN=$(date +%-M)
 
-# 2. Travel Logic (Restrict cellular data usage)
+# Pausa si detecta la red WiFi del coche
 if [ "$CURRENT_SSID" == "Tesla" ]; then
     if [ "$CURRENT_HOUR" -ne 3 ] || [ "$CURRENT_MIN" -gt 30 ]; then
-        mosquitto_pub -h $MQTT_HOST -u $MQTT_USER -P $MQTT_PASS \
-        -t $TOPIC_STATUS -m "Paused (Tesla Network - Off Hours)"
+        mosquitto_pub -h "$MQTT_HOST" -u "$MQTT_USER" -P "$MQTT_PASS" \
+            -t "$TOPIC_STATUS" -m "Pausado (Red Tesla)"
         exit 0
     fi
 fi
 
-# 3. Mount & Sync
-mosquitto_pub -h $MQTT_HOST -u $MQTT_USER -P $MQTT_PASS \
--t $TOPIC_STATUS -m "Syncing..."
+mosquitto_pub -h "$MQTT_HOST" -u "$MQTT_USER" -P "$MQTT_PASS" \
+    -t "$TOPIC_STATUS" -m "Sincronizando..."
 
-sudo mount -t vfat -o loop,rw,umask=000 /teslacam.bin /mnt/tesladisk
+# --- PASO 1: Montaje Seguro ---
+sync
+sudo umount -l /mnt/tesladisk 2>/dev/null
+sudo mount -t vfat -o loop,ro,umask=000,time_offset=-480 \
+    /teslacam.bin /mnt/tesladisk
 
+# --- PASO 2: Anti-formateo ---
+if [ -d "/mnt/tesladisk" ] && [ ! -d "/mnt/tesladisk/TeslaCam" ]; then
+    sudo mount -o remount,rw /mnt/tesladisk
+    sudo mkdir -p /mnt/tesladisk/TeslaCam
+    sudo mount -o remount,ro /mnt/tesladisk
+fi
+
+# --- PASO 3: Sincronización ---
 if [ -d "/mnt/tesladisk/TeslaCam" ]; then
-    rsync -av /mnt/tesladisk/TeslaCam/ root@<NAS_IP>:/path/to/destination/
+    rsync -av /mnt/tesladisk/TeslaCam/ \
+        "${NAS_USER}@${NAS_HOST}:${NAS_PATH}"
 
     if [ $? -eq 0 ]; then
-        if mount | grep /mnt/tesladisk | grep -q "(rw,"; then
-            sudo find /mnt/tesladisk/TeslaCam/ -type f -delete 2>/dev/null
-            mosquitto_pub -h $MQTT_HOST -u $MQTT_USER -P $MQTT_PASS \
-            -t $TOPIC_STATUS -m "Online - Backup OK"
-        else
-            mosquitto_pub -h $MQTT_HOST -u $MQTT_USER -P $MQTT_PASS \
-            -t $TOPIC_STATUS -m "Backup OK (Disk Busy)"
-        fi
-
-        mosquitto_pub -h $MQTT_HOST -u $MQTT_USER -P $MQTT_PASS \
-        -t $TOPIC_TIME -m "$(date +'%H:%M %d/%m')"
+        mosquitto_pub -h "$MQTT_HOST" -u "$MQTT_USER" -P "$MQTT_PASS" \
+            -t "$TOPIC_STATUS" -m "Backup OK"
+        mosquitto_pub -h "$MQTT_HOST" -u "$MQTT_USER" -P "$MQTT_PASS" \
+            -t "$TOPIC_TIME" -m "$(date +'%H:%M %d/%m')"
+    else
+        mosquitto_pub -h "$MQTT_HOST" -u "$MQTT_USER" -P "$MQTT_PASS" \
+            -t "$TOPIC_STATUS" -m "Error en rsync"
     fi
+else
+    mosquitto_pub -h "$MQTT_HOST" -u "$MQTT_USER" -P "$MQTT_PASS" \
+        -t "$TOPIC_STATUS" -m "Error: Disco no accesible"
 fi
 
 sudo umount -l /mnt/tesladisk
+
 ```
 
 ## ⏰ Automation (Cron)
