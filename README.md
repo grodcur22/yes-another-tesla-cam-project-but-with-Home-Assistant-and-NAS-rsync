@@ -67,74 +67,97 @@ Create the script at `/home/teslacam/sync_tesla.sh`.
 
 ```bash
 #!/bin/bash
+# Evitar que el script se ejecute si ya hay uno corriendo
+if pidof -x $(basename $0) > /dev/null; then
+  for pid in $(pidof -x $(basename $0)); do
+    if [ $pid != $$ ]; then
+      exit 0
+    fi
+  done
+fi
 
-# ======================
 # Configuración MQTT
-# ======================
-MQTT_HOST="${MQTT_HOST}"
-MQTT_USER="${MQTT_USER}"
-MQTT_PASS="${MQTT_PASS}"
-
+MQTT_HOST="XXX.XXX.XXX.XXX"
+MQTT_USER="********"
+MQTT_PASS="********"
 TOPIC_STATUS="tesla/pi/status"
 TOPIC_TIME="tesla/pi/last_sync"
 
-# ======================
-# Configuración NAS
-# ======================
-NAS_USER="${NAS_USER}"
-NAS_HOST="${NAS_HOST}"
-NAS_PATH="${NAS_PATH}"
+# --- WATCHDOG DEL BINARIO ---
+if [ ! -f "/teslacam.bin" ]; then
+    mosquitto_pub -h $MQTT_HOST -u $MQTT_USER -P $MQTT_PASS -t $TOPIC_STATUS -m "ERROR: Binario no encontrado. Recreando..."
+    # Recrear el binario (usamos 24000 para mantener tus 24GB)
+    sudo dd if=/dev/zero of=/teslacam.bin bs=1M count=24000
+    sudo mkfs.vfat /teslacam.bin -F 32 -n TESLACAM
+    
+    # Recrear estructura interna
+    sudo mkdir -p /mnt/tesladisk
+    sudo mount -o loop /teslacam.bin /mnt/tesladisk
+    sudo mkdir -p /mnt/tesladisk/TeslaCam
+    touch /mnt/tesladisk/TeslaCam/.mcu1_ready
+    sudo umount /mnt/tesladisk
+    
+    mosquitto_pub -h $MQTT_HOST -u $MQTT_USER -P $MQTT_PASS -t $TOPIC_STATUS -m "Binario restaurado OK"
+fi
 
 # 1. Detectar red y hora
 CURRENT_SSID=$(/usr/sbin/iwgetid -r)
 CURRENT_HOUR=$(date +%-H)
 CURRENT_MIN=$(date +%-M)
 
-# Pausa si detecta la red WiFi del coche
+# Pausa si detecta la red WiFi del coche (evitar bucles de datos)
 if [ "$CURRENT_SSID" == "Tesla" ]; then
     if [ "$CURRENT_HOUR" -ne 3 ] || [ "$CURRENT_MIN" -gt 30 ]; then
-        mosquitto_pub -h "$MQTT_HOST" -u "$MQTT_USER" -P "$MQTT_PASS" \
-            -t "$TOPIC_STATUS" -m "Pausado (Red Tesla)"
+        mosquitto_pub -h $MQTT_HOST -u $MQTT_USER -P $MQTT_PASS -t $TOPIC_STATUS -m "Pausado (Red Tesla)"
         exit 0
     fi
 fi
 
-mosquitto_pub -h "$MQTT_HOST" -u "$MQTT_USER" -P "$MQTT_PASS" \
-    -t "$TOPIC_STATUS" -m "Sincronizando..."
+# --- MEJORA 1: Reparación del Contenedor (Anti-Corrupción) ---
+# Si el Tesla cortó la energía, esto repara el binario antes de intentar montarlo
+sudo dosfsck -a /teslacam.bin
+
+mosquitto_pub -h $MQTT_HOST -u $MQTT_USER -P $MQTT_PASS -t $TOPIC_STATUS -m "Sincronizando..."
 
 # --- PASO 1: Montaje Seguro ---
 sync
 sudo umount -l /mnt/tesladisk 2>/dev/null
-sudo mount -t vfat -o loop,ro,umask=000,time_offset=-480 \
-    /teslacam.bin /mnt/tesladisk
+# Mantenemos tu offset intacto
+sudo mount -t vfat -o loop,ro,umask=000,time_offset=-480 /teslacam.bin /mnt/tesladisk
 
-# --- PASO 2: Anti-formateo ---
+# --- PASO 2: Verificación y Auto-reparación (Anti-formateo) ---
+# Si el coche formateó el disco, recreamos la carpeta TeslaCam
 if [ -d "/mnt/tesladisk" ] && [ ! -d "/mnt/tesladisk/TeslaCam" ]; then
+    echo "Carpeta TeslaCam no encontrada. Recreando estructura..."
     sudo mount -o remount,rw /mnt/tesladisk
     sudo mkdir -p /mnt/tesladisk/TeslaCam
+    # Tip para MCU1: crear archivo vacío para asegurar que el sistema lo reconozca
+    touch /mnt/tesladisk/TeslaCam/.mcu1_ready
     sudo mount -o remount,ro /mnt/tesladisk
 fi
 
 # --- PASO 3: Sincronización ---
 if [ -d "/mnt/tesladisk/TeslaCam" ]; then
-    rsync -av /mnt/tesladisk/TeslaCam/ \
-        "${NAS_USER}@${NAS_HOST}:${NAS_PATH}"
-
+    # rsync hacia el NAS
+    rsync -av /mnt/tesladisk/TeslaCam/ root@XXX.XXX.XXX.XXX:/mnt/nasXXX/XXX/tesla_videos/
+    
     if [ $? -eq 0 ]; then
-        mosquitto_pub -h "$MQTT_HOST" -u "$MQTT_USER" -P "$MQTT_PASS" \
-            -t "$TOPIC_STATUS" -m "Backup OK"
-        mosquitto_pub -h "$MQTT_HOST" -u "$MQTT_USER" -P "$MQTT_PASS" \
-            -t "$TOPIC_TIME" -m "$(date +'%H:%M %d/%m')"
+        mosquitto_pub -h $MQTT_HOST -u $MQTT_USER -P $MQTT_PASS -t $TOPIC_STATUS -m "Backup OK"
+        mosquitto_pub -h $MQTT_HOST -u $MQTT_USER -P $MQTT_PASS -t $TOPIC_TIME -m "$(date +'%H:%M %d/%m')"
     else
-        mosquitto_pub -h "$MQTT_HOST" -u "$MQTT_USER" -P "$MQTT_PASS" \
-            -t "$TOPIC_STATUS" -m "Error en rsync"
+        mosquitto_pub -h $MQTT_HOST -u $MQTT_USER -P $MQTT_PASS -t $TOPIC_STATUS -m "Error en rsync"
     fi
 else
-    mosquitto_pub -h "$MQTT_HOST" -u "$MQTT_USER" -P "$MQTT_PASS" \
-        -t "$TOPIC_STATUS" -m "Error: Disco no accesible"
+    mosquitto_pub -h $MQTT_HOST -u $MQTT_USER -P $MQTT_PASS -t $TOPIC_STATUS -m "Error: Disco no accesible"
 fi
 
+# --- PASO 4: Limpieza y Re-conexión del USB ---
 sudo umount -l /mnt/tesladisk
+sync
+# MEJORA 2: Forzar al Tesla a re-detectar el USB (evita la X roja tras sincronizar)
+sudo modprobe -r g_mass_storage
+sudo modprobe g_mass_storage file=/teslacam.bin stall=0 removable=1
+
 
 ```
 
